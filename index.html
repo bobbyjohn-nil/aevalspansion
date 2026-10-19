@@ -7,13 +7,15 @@
 <style>
   html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
   #wrap { display: flex; flex-direction: column; height: 100%; }
-  #top { display: flex; gap: 24px; padding: 6px 12px; background: #1b1b1b; font-size: 14px; white-space: nowrap; }
+  #top { display: flex; gap: 20px; align-items: center; padding: 6px 12px; background: #1b1b1b; font-size: 14px; white-space: nowrap; }
   #top b { color: #ffd54a; }
-  #msg { color: #ffb347; }
+  #msg { color: #ffb347; white-space: normal; }
   #game { flex: 1; min-height: 0; width: 100%; object-fit: contain; display: block; cursor: crosshair; background: #000; }
   #panel { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 12px; background: #1b1b1b; font-size: 13px; min-height: 26px; }
-  #panel button { background: #333; color: #eee; border: 1px solid #555; border-radius: 3px; padding: 3px 8px; cursor: pointer; font-size: 13px; }
-  #panel button:hover { background: #444; }
+  button { background: #333; color: #eee; border: 1px solid #555; border-radius: 3px; padding: 3px 8px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #444; }
+  #dispatch { background: #2d5a2d; border-color: #4a8a4a; }
+  .dim { color: #999; }
 </style>
 </head>
 <body>
@@ -22,6 +24,8 @@
     <span>Gold: <b id="gold">0</b></span>
     <span id="counts"></span>
     <span id="time"></span>
+    <span id="carrier"></span>
+    <button id="dispatch" data-act="dispatch" hidden>[D] Dispatch carrier</button>
     <span id="msg"></span>
   </div>
   <canvas id="game"></canvas>
@@ -31,54 +35,72 @@
 'use strict';
 
 // ---------- Constants ----------
-const W = 1200, H = 700;
+const W = 1200, H = 700, CELL = 20, GW = W / CELL, GH = H / CELL;
 const PLAYER = 0, ENEMY = 1;
 const TEAM_COLOR = ['#4a9eff', '#ff5555'];
+const TEAM_RGB = [[74, 158, 255], [255, 85, 85]];
 
+// terr = radius of territory influence each thing projects.
 const UNIT_DEFS = {
-  worker:  { name: 'Worker',  hp: 30, speed: 90, r: 7, cost: 50, time: 6, dmg: 2, range: 14, aggro: 0,   cd: 1.0 },
-  soldier: { name: 'Soldier', hp: 60, speed: 75, r: 8, cost: 60, time: 5, dmg: 8, range: 18, aggro: 130, cd: 0.8 },
+  worker:    { name: 'Worker',    hp: 30,  speed: 90,  r: 7,  cost: 50,  time: 6,  dmg: 2,  range: 14, aggro: 0,   cd: 1.0, terr: 35 },
+  soldier:   { name: 'Soldier',   hp: 60,  speed: 75,  r: 8,  cost: 60,  time: 5,  dmg: 8,  range: 18, aggro: 130, cd: 0.8, terr: 65 },
+  commander: { name: 'Commander', hp: 160, speed: 70,  r: 10, cost: 150, time: 10, dmg: 12, range: 20, aggro: 130, cd: 0.8, terr: 160 },
+  carrier:   { name: 'Carrier',   hp: 25,  speed: 140, r: 5,  cost: 0,   time: 0,  dmg: 0,  range: 0,  aggro: 0,   cd: 1.0, terr: 0 },
 };
 const BUILDING_DEFS = {
-  hq:       { name: 'HQ',       hp: 800, w: 70, h: 70, cost: 0,   buildTime: 0,  trains: 'worker',  key: 'W' },
-  barracks: { name: 'Barracks', hp: 350, w: 56, h: 56, cost: 100, buildTime: 15, trains: 'soldier', key: 'S' },
+  hq:       { name: 'HQ',       hp: 800, w: 70, h: 70, cost: 0,   buildTime: 0,  terr: 240, siteTerr: 0,  sight: 260 },
+  barracks: { name: 'Barracks', hp: 350, w: 56, h: 56, cost: 100, buildTime: 15, terr: 200, siteTerr: 70, sight: 180 },
 };
 const MINE_R = 16, GATHER_TIME = 1.5, CARRY = 10, MAX_QUEUE = 5;
+const CHAIN_RANGE = 260;          // max distance between an outpost and the HQ / another outpost
+const CARRIER_SIGHT = 90, CARRIER_DWELL = 1, CARRIER_AUTO = 12, CARRIER_RESPAWN = 8;
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 canvas.width = W; canvas.height = H;
+const terrCanvas = document.createElement('canvas');
+terrCanvas.width = GW; terrCanvas.height = GH;
+const terrCtx = terrCanvas.getContext('2d');
+const terrImg = terrCtx.createImageData(GW, GH);
 const $ = id => document.getElementById(id);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 let S; // game state
 
 // ---------- Setup ----------
+function newTeam() { return { known: {}, live: new Set(), carrier: null, carrierTimer: 0, outpostCount: 0 }; }
+
 function newGame() {
   S = {
     t: 0, nextId: 1, gold: [150, 150],
     units: [], buildings: [], mines: [],
+    teams: [newTeam(), newTeam()],
+    terr: new Int8Array(GW * GH), inf: [new Float32Array(GW * GH), new Float32Array(GW * GH)],
     selected: [], placing: null, drag: null, mouse: { x: 0, y: 0 },
-    msg: '', msgUntil: 0, over: null, paused: false, ai: { waveTimer: 0 }, panelSig: null,
+    msg: '', msgUntil: 0, over: null, paused: false, panelSig: null,
   };
-  addBuilding(PLAYER, 'hq', 120, H / 2, true);
-  addBuilding(ENEMY, 'hq', W - 120, H / 2, true);
+  const hqs = [addBuilding(PLAYER, 'hq', 120, H / 2, true), addBuilding(ENEMY, 'hq', W - 120, H / 2, true)];
   const mine = (x, y, gold) => S.mines.push({ id: S.nextId++, kind: 'mine', x, y, r: MINE_R, gold });
   mine(140, 150, 1500); mine(140, H - 150, 1500);
   mine(W - 140, 150, 1500); mine(W - 140, H - 150, 1500);
-  mine(W / 2, H / 2, 4000);
-  for (let i = 0; i < 3; i++) {
-    for (const [team, x] of [[PLAYER, 190], [ENEMY, W - 190]]) {
-      const u = addUnit(team, 'worker', x, H / 2 - 30 + i * 30);
-      u.order = { type: 'gather', mine: nearestMine(u.x, u.y) };
+  mine(W / 2, 120, 2500); mine(W / 2, H - 120, 2500);
+  computeTerritory();
+  for (const team of [PLAYER, ENEMY]) {
+    const x = team === PLAYER ? 190 : W - 190;
+    for (let i = 0; i < 3; i++) {
+      const u = addUnit(team, 'worker', x, H / 2 - 30 + i * 30, hqs[team].id);
+      const m = nearestOwnedMine(team, u.x, u.y);
+      if (m) u.order = { type: 'gather', mine: m };
     }
+    spawnCarrier(team);
   }
+  observeLive(PLAYER);
 }
 
-function addUnit(team, type, x, y) {
+function addUnit(team, type, x, y, group) {
   const d = UNIT_DEFS[type];
-  const u = { id: S.nextId++, kind: 'unit', team, type, x, y, r: d.r, hp: d.hp, maxHp: d.hp,
-              order: { type: 'idle' }, engage: null, carry: 0, timer: 0, cd: 0, hit: null };
+  const u = { id: S.nextId++, kind: 'unit', team, type, x, y, r: d.r, hp: d.hp, maxHp: d.hp, group,
+              order: { type: 'idle' }, engage: null, carry: 0, timer: 0, cd: 0, hit: null, idle: 0, post: { x, y } };
   S.units.push(u);
   return u;
 }
@@ -86,7 +108,8 @@ function addUnit(team, type, x, y) {
 function addBuilding(team, type, x, y, built) {
   const d = BUILDING_DEFS[type];
   const b = { id: S.nextId++, kind: 'building', team, type, x, y, w: d.w, h: d.h,
-              hp: built ? d.hp : 1, maxHp: d.hp, built, progress: built ? 1 : 0, queue: [], qTime: 0 };
+              hp: built ? d.hp : 1, maxHp: d.hp, built, progress: built ? 1 : 0, queue: [], qTime: 0, order: null, num: 0 };
+  if (type === 'barracks') b.num = ++S.teams[team].outpostCount;
   S.buildings.push(b);
   return b;
 }
@@ -99,19 +122,41 @@ function edgeDist(x, y, e) {
   }
   return Math.hypot(e.x - x, e.y - y) - e.r;
 }
+const inCircle = (e, cx, cy, r) => Math.hypot(e.x - cx, e.y - cy) <= r;
 
-function moveToward(u, x, y, step) {
+function blockedBy(x, y, r, ignore) {
+  for (const b of S.buildings)
+    if (b !== ignore && b.hp > 0 && Math.abs(x - b.x) < b.w / 2 + r && Math.abs(y - b.y) < b.h / 2 + r) return b;
+  return null;
+}
+
+// Step toward a point, steering around any building in the way (except `ignore`, the one we're heading into).
+function moveToward(u, x, y, step, ignore) {
   const dx = x - u.x, dy = y - u.y, dist = Math.hypot(dx, dy);
   if (dist <= step) { u.x = x; u.y = y; return true; }
-  u.x += dx / dist * step; u.y += dy / dist * step;
+  const r = u.r - 0.5, ux = dx / dist, uy = dy / dist;
+  const b = blockedBy(u.x + ux * step, u.y + uy * step, r, ignore);
+  if (!b) { u.x += ux * step; u.y += uy * step; return false; }
+  // Try increasingly sharp turns, first toward the side of the building we're already on.
+  const sign = ux * (u.y - b.y) - uy * (u.x - b.x) >= 0 ? 1 : -1;
+  for (const deg of [30, 60, 90, 120, 150]) for (const s of [sign, -sign]) {
+    const a = s * deg * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+    const vx = c * ux - sn * uy, vy = sn * ux + c * uy;
+    if (!blockedBy(u.x + vx * step, u.y + vy * step, r, ignore)) { u.x += vx * step; u.y += vy * step; return false; }
+  }
   return false;
 }
 
 // Walk toward an entity; returns true once within `within` of its edge.
 function approach(u, e, step, within) {
   if (edgeDist(u.x, u.y, e) <= within) return true;
-  moveToward(u, e.x, e.y, step);
+  moveToward(u, e.x, e.y, step, e.kind === 'building' ? e : null);
   return false;
+}
+
+// After a fight, troops walk back to wherever they were last told to stand.
+function returnToPost(u) {
+  if (u.post && Math.hypot(u.post.x - u.x, u.post.y - u.y) > 12) u.order = { type: 'move', x: u.post.x, y: u.post.y };
 }
 
 function nearest(list, x, y, filter) {
@@ -123,8 +168,19 @@ function nearest(list, x, y, filter) {
   }
   return best;
 }
-const nearestMine = (x, y) => nearest(S.mines, x, y, m => m.gold > 0);
-const nearestHQ = (team, x, y) => nearest(S.buildings, x, y, b => b.team === team && b.type === 'hq' && b.built);
+const byId = id => S.buildings.find(b => b.id === id) || S.units.find(u => u.id === id) || null;
+const findHQ = team => S.buildings.find(b => b.team === team && b.type === 'hq' && b.hp > 0) || null;
+const ownOutposts = team => S.buildings.filter(b => b.team === team && b.type === 'barracks' && b.built && b.hp > 0);
+const outpostName = b => b.type === 'hq' ? 'HQ' : `Outpost ${b.num}`;
+const canMine = (m, team) => m.gold > 0 && owner(m.x, m.y) === team;
+const nearestOwnedMine = (team, x, y) => nearest(S.mines, x, y, m => canMine(m, team));
+
+function formation(x, y, i, n, r) {
+  const cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+  return { x: clamp(x + (i % cols - (cols - 1) / 2) * 22, r, W - r), y: clamp(y + (Math.floor(i / cols) - (rows - 1) / 2) * 22, r, H - r) };
+}
+// A spot just outside a building, on the side facing the middle of the map.
+const rallyPoint = b => ({ x: b.x + (b.team === PLAYER ? 1 : -1) * (b.w / 2 + 40), y: b.y });
 
 function nearestEnemy(u, range) {
   let best = null, bd = Infinity;
@@ -138,23 +194,60 @@ function nearestEnemy(u, range) {
   return best;
 }
 
+// ---------- Territory ----------
+function computeTerritory() {
+  const inf = S.inf;
+  inf[0].fill(0); inf[1].fill(0);
+  const add = (team, x, y, r) => {
+    if (r <= 0) return;
+    const a = inf[team];
+    const x0 = Math.max(0, Math.floor((x - r) / CELL)), x1 = Math.min(GW - 1, Math.floor((x + r) / CELL));
+    const y0 = Math.max(0, Math.floor((y - r) / CELL)), y1 = Math.min(GH - 1, Math.floor((y + r) / CELL));
+    for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+      const v = 1 - Math.hypot(gx * CELL + CELL / 2 - x, gy * CELL + CELL / 2 - y) / r;
+      if (v > 0) { const i = gy * GW + gx; if (v > a[i]) a[i] = v; }
+    }
+  };
+  for (const b of S.buildings) { const d = BUILDING_DEFS[b.type]; add(b.team, b.x, b.y, b.built ? d.terr : d.siteTerr); }
+  for (const u of S.units) add(u.team, u.x, u.y, UNIT_DEFS[u.type].terr);
+  for (let i = 0; i < GW * GH; i++) S.terr[i] = inf[0][i] > inf[1][i] ? 0 : inf[1][i] > inf[0][i] ? 1 : -1;
+}
+function owner(x, y) {
+  return S.terr[clamp(Math.floor(y / CELL), 0, GH - 1) * GW + clamp(Math.floor(x / CELL), 0, GW - 1)];
+}
+
 // ---------- Units ----------
 function updateUnit(u, dt) {
+  if (u.type === 'carrier') { updateCarrier(u, dt); return; }
   const d = UNIT_DEFS[u.type];
   u.cd = Math.max(0, u.cd - dt);
 
-  // Soldiers automatically fight anything that comes near while idle or moving.
+  // Fighters automatically engage anything that comes near while idle or moving.
   if (d.aggro > 0) {
-    if (u.engage && (u.engage.hp <= 0 || edgeDist(u.x, u.y, u.engage) > d.aggro * 1.5)) u.engage = null;
+    if (u.engage && (u.engage.hp <= 0 || edgeDist(u.x, u.y, u.engage) > d.aggro * 1.5)) {
+      u.engage = null;
+      if (u.order.type === 'idle') returnToPost(u);
+    }
     if (!u.engage && (u.order.type === 'idle' || u.order.type === 'move')) u.engage = nearestEnemy(u, d.aggro);
     if (u.engage) { attack(u, u.engage, d, dt); return; }
   }
 
   const o = u.order;
-  if (o.type === 'move') {
-    if (moveToward(u, o.x, o.y, d.speed * dt)) u.order = { type: 'idle' };
+  if (o.type === 'idle') {
+    // Idle workers look for a mine inside their territory every couple of seconds.
+    if (u.type === 'worker') {
+      u.idle += dt;
+      if (u.idle > 2) { u.idle = 0; const m = nearestOwnedMine(u.team, u.x, u.y); if (m) u.order = { type: 'gather', mine: m }; }
+    }
+  } else if (o.type === 'move') {
+    const before = Math.hypot(o.x - u.x, o.y - u.y);
+    if (moveToward(u, o.x, o.y, d.speed * dt)) { u.order = { type: 'idle' }; u.post = { x: u.x, y: u.y }; return; }
+    // Give up on a destination we can't make progress toward (blocked by a crowd) and hold here.
+    if (o.last !== undefined && o.last - before < d.speed * dt * 0.2) o.stall = (o.stall || 0) + dt; else o.stall = 0;
+    o.last = before;
+    if (o.stall > 1.5) { u.order = { type: 'idle' }; u.post = { x: u.x, y: u.y }; }
   } else if (o.type === 'attack') {
-    if (o.target.hp <= 0) u.order = { type: 'idle' }; else attack(u, o.target, d, dt);
+    if (o.target.hp <= 0) { u.order = { type: 'idle' }; returnToPost(u); } else attack(u, o.target, d, dt);
   } else if (o.type === 'gather') {
     gather(u, o, d, dt);
   } else if (o.type === 'build') {
@@ -171,15 +264,17 @@ function attack(u, target, d, dt) {
 }
 
 function gather(u, o, d, dt) {
-  if (u.carry >= CARRY || (u.carry > 0 && o.mine.gold <= 0)) {
-    const hq = nearestHQ(u.team, u.x, u.y);
-    if (!hq) { u.order = { type: 'idle' }; return; }
-    if (approach(u, hq, d.speed * dt, u.r + 4)) { S.gold[u.team] += u.carry; u.carry = 0; }
+  if (u.carry >= CARRY || (u.carry > 0 && !canMine(o.mine, u.team))) {
+    // Gold can be dropped at any finished building of your own, so outposts double as depots.
+    const depot = nearest(S.buildings, u.x, u.y, b => b.team === u.team && b.built);
+    if (!depot) { u.order = { type: 'idle' }; return; }
+    if (approach(u, depot, d.speed * dt, u.r + 4)) { S.gold[u.team] += u.carry; u.carry = 0; }
     return;
   }
-  if (o.mine.gold <= 0) {
-    const m = nearestMine(u.x, u.y);
-    if (m) o.mine = m; else u.order = { type: 'idle' };
+  if (!canMine(o.mine, u.team)) {
+    const m = nearestOwnedMine(u.team, u.x, u.y);
+    if (m) o.mine = m;
+    else { u.order = { type: 'idle' }; if (u.team === PLAYER) say('No gold mine inside your territory. Expand with outposts and troops.'); }
     return;
   }
   if (approach(u, o.mine, d.speed * dt, u.r + 4)) {
@@ -201,7 +296,7 @@ function build(u, o, d, dt) {
     b.hp = Math.min(b.maxHp, b.hp + b.maxHp * dt / bt);
     if (b.progress >= 1) {
       b.built = true; b.hp = b.maxHp;
-      const m = nearestMine(u.x, u.y);
+      const m = nearestOwnedMine(u.team, u.x, u.y);
       u.order = m ? { type: 'gather', mine: m } : { type: 'idle' };
     }
   }
@@ -241,76 +336,228 @@ function updateBuilding(b, dt) {
   if (b.qTime >= UNIT_DEFS[type].time) {
     b.qTime = 0; b.queue.shift();
     const dir = b.team === PLAYER ? 1 : -1;
-    const u = addUnit(b.team, type, b.x + dir * (b.w / 2 + 12), b.y + (Math.random() * 40 - 20));
-    if (type === 'worker') { const m = nearestMine(u.x, u.y); if (m) u.order = { type: 'gather', mine: m }; }
+    const u = addUnit(b.team, type, b.x + dir * (b.w / 2 + 12), b.y + (Math.random() * 40 - 20), b.id);
+    if (type === 'worker') { const m = nearestOwnedMine(b.team, u.x, u.y); if (m) u.order = { type: 'gather', mine: m }; }
   }
 }
 
 function train(b, type) {
   const d = UNIT_DEFS[type];
   if (!b.built || b.queue.length >= MAX_QUEUE) return false;
+  if (type === 'commander' && (S.units.some(u => u.team === b.team && u.type === 'commander') || b.queue.includes('commander'))) {
+    if (b.team === PLAYER) say('You already have a commander.');
+    return false;
+  }
   if (S.gold[b.team] < d.cost) { if (b.team === PLAYER) say(`Not enough gold (need ${d.cost})`); return false; }
   S.gold[b.team] -= d.cost;
   b.queue.push(type);
   return true;
 }
 
-function canPlace(type, x, y) {
+// Returns null if the spot is fine, otherwise the reason it isn't.
+function placeFail(type, x, y, team) {
   const d = BUILDING_DEFS[type];
-  if (x - d.w / 2 < 10 || y - d.h / 2 < 10 || x + d.w / 2 > W - 10 || y + d.h / 2 > H - 10) return false;
+  if (x - d.w / 2 < 10 || y - d.h / 2 < 10 || x + d.w / 2 > W - 10 || y + d.h / 2 > H - 10) return 'Too close to the map edge';
   for (const b of S.buildings)
-    if (Math.abs(b.x - x) < (b.w + d.w) / 2 + 10 && Math.abs(b.y - y) < (b.h + d.h) / 2 + 10) return false;
+    if (Math.abs(b.x - x) < (b.w + d.w) / 2 + 10 && Math.abs(b.y - y) < (b.h + d.h) / 2 + 10) return 'Overlaps a building';
   for (const m of S.mines)
-    if (Math.abs(m.x - x) < d.w / 2 + m.r + 10 && Math.abs(m.y - y) < d.h / 2 + m.r + 10) return false;
-  return true;
+    if (Math.abs(m.x - x) < d.w / 2 + m.r + 10 && Math.abs(m.y - y) < d.h / 2 + m.r + 10) return 'Overlaps a gold mine';
+  if (owner(x, y) !== team) return 'Must be inside your territory';
+  if (type === 'barracks' && !S.buildings.some(b => b.team === team && Math.hypot(b.x - x, b.y - y) <= CHAIN_RANGE))
+    return `Must be within ${CHAIN_RANGE} of your HQ or another outpost`;
+  return null;
 }
 
 function placeSite(team, type, x, y, builders) {
   const d = BUILDING_DEFS[type];
   if (S.gold[team] < d.cost) { if (team === PLAYER) say(`Not enough gold (need ${d.cost})`); return null; }
-  if (!canPlace(type, x, y)) { if (team === PLAYER) say("Can't build there"); return null; }
+  const why = placeFail(type, x, y, team);
+  if (why) { if (team === PLAYER) say(why); return null; }
   S.gold[team] -= d.cost;
   const site = addBuilding(team, type, x, y, false);
   for (const u of builders) { u.engage = null; u.order = { type: 'build', site }; }
   return site;
 }
 
+// ---------- Groups and orders ----------
+function members(b) { return S.units.filter(u => u.group === b.id && u.hp > 0 && u.type !== 'carrier'); }
+
+function transferUnit(u, dest, i = 0, n = 1) {
+  u.group = dest.id; u.engage = null;
+  const p = rallyPoint(dest);
+  u.order = { type: 'move', ...formation(p.x, p.y, i, n, u.r) };
+}
+
+// Apply an order to every unit stationed at an outpost.
+function applyGroupOrder(b, o) {
+  const ms = members(b);
+  b.order = o.type === 'return' ? null : o;
+  ms.forEach((u, i) => {
+    u.engage = null;
+    if (o.type === 'move') u.order = { type: 'move', ...formation(o.x, o.y, i, ms.length, u.r) };
+    else if (o.type === 'return') { const p = rallyPoint(b); u.order = { type: 'move', ...formation(p.x, p.y, i, ms.length, u.r) }; }
+    else if (o.type === 'transfer') { const dest = byId(o.to); if (dest && dest.kind === 'building' && dest.built) transferUnit(u, dest, i, ms.length); }
+  });
+}
+
+// Orders for an outpost can only be handed to the carrier while it is at the HQ.
+function issueOutpostOrder(team, b, order) {
+  const c = S.teams[team].carrier;
+  if (!c || c.stage !== 'hq') {
+    if (team === PLAYER) say(c ? 'The carrier is away. New orders must wait until it is back at HQ.' : 'No carrier right now. A replacement is on its way.');
+    return false;
+  }
+  c.manifest[b.id] = order;
+  if (team === PLAYER) say(`Order loaded for ${outpostName(b)}. Press D to dispatch the carrier.`);
+  return true;
+}
+
+function describeOrder(o) {
+  if (!o) return 'none';
+  if (o.type === 'move') return `attack-move to (${Math.round(o.x)}, ${Math.round(o.y)})`;
+  if (o.type === 'return') return 'recall to outpost';
+  const d = byId(o.to);
+  return `transfer to ${d ? outpostName(d) : '?'}`;
+}
+
+// ---------- Information carrier ----------
+function newReport() { return { entries: {}, clears: [], garrisons: {} }; }
+
+function snap(e) {
+  const v = { id: e.id, kind: e.kind, team: e.team, type: e.type, x: e.x, y: e.y, hp: e.hp, maxHp: e.maxHp, t: S.t, ref: e };
+  if (e.kind === 'unit') { v.r = e.r; v.carry = e.carry; v.group = e.group; }
+  else { v.w = e.w; v.h = e.h; v.built = e.built; v.progress = e.progress; v.queue = e.queue.length; v.num = e.num;
+         v.qFrac = e.queue.length ? e.qTime / UNIT_DEFS[e.queue[0]].time : 0; }
+  return v;
+}
+
+// Record everything inside a circle into a report (and remember that the circle was looked at).
+function observeInto(rep, cx, cy, r) {
+  rep.clears.push({ x: cx, y: cy, r, t: S.t });
+  for (const e of S.units) if (e.hp > 0 && inCircle(e, cx, cy, r)) rep.entries[e.id] = snap(e);
+  for (const e of S.buildings) if (e.hp > 0 && inCircle(e, cx, cy, r)) rep.entries[e.id] = snap(e);
+}
+
+// An outpost knows where its own troops are, wherever they went.
+function reportGarrison(rep, b) {
+  const ids = [];
+  for (const u of members(b)) { rep.entries[u.id] = snap(u); ids.push(u.id); }
+  rep.garrisons[b.id] = { ids, t: S.t };
+}
+
+function mergeReport(known, rep) {
+  for (const c of rep.clears)
+    for (const id in known) { const k = known[id]; if (k.t < c.t && inCircle(k, c.x, c.y, c.r)) delete known[id]; }
+  for (const g in rep.garrisons) {
+    const { ids, t } = rep.garrisons[g];
+    for (const id in known) { const k = known[id]; if (k.kind === 'unit' && k.group === +g && k.t < t && !ids.includes(k.id)) delete known[id]; }
+  }
+  for (const id in rep.entries) { const v = rep.entries[id]; if (!known[id] || known[id].t <= v.t) known[id] = v; }
+}
+
+// What the player can see right now: the HQ's surroundings, plus their own buildings and carrier.
+function observeLive(team) {
+  const tm = S.teams[team], known = tm.known, hq = findHQ(team), live = new Set();
+  const see = (cx, cy, r) => {
+    for (const id in known) { const k = known[id]; if (!live.has(k.id) && inCircle(k, cx, cy, r)) delete known[id]; }
+    for (const e of [...S.units, ...S.buildings]) if (e.hp > 0 && inCircle(e, cx, cy, r)) { known[e.id] = snap(e); live.add(e.id); }
+  };
+  if (hq) see(hq.x, hq.y, BUILDING_DEFS.hq.sight);
+  for (const b of S.buildings) if (b.team === team && b.hp > 0) { known[b.id] = snap(b); live.add(b.id); }
+  for (const u of S.units) if (u.team === team && u.type === 'carrier' && u.hp > 0) { known[u.id] = snap(u); live.add(u.id); }
+  for (const id in known) { const k = known[id]; if (k.team === team && (k.kind === 'building' || k.type === 'carrier') && !live.has(k.id)) delete known[id]; }
+  tm.live = live;
+}
+
+function spawnCarrier(team) {
+  const hq = findHQ(team);
+  if (!hq) return null;
+  const c = addUnit(team, 'carrier', hq.x + (team === PLAYER ? 1 : -1) * (hq.w / 2 + 12), hq.y - 30, null);
+  Object.assign(c, { stage: 'hq', wait: 0, route: [], stop: 0, arrived: false, dwell: 0, obs: 0, manifest: {}, report: newReport() });
+  S.teams[team].carrier = c;
+  return c;
+}
+
+function dispatchCarrier(team) {
+  const c = S.teams[team].carrier;
+  if (!c || c.stage !== 'hq') return false;
+  const stops = ownOutposts(team).map(b => b.id);
+  if (!stops.length) { if (team === PLAYER) say('No outposts to visit yet.'); return false; }
+  Object.assign(c, { stage: 'out', route: stops, stop: 0, arrived: false, dwell: 0, report: newReport() });
+  if (team === PLAYER) say('Carrier dispatched. Reports arrive when it returns.');
+  return true;
+}
+
+function updateCarrier(c, dt) {
+  const d = UNIT_DEFS.carrier, hq = findHQ(c.team);
+  if (!hq) return;
+  if (c.stage === 'hq') {
+    c.wait += dt;
+    if (c.wait >= CARRIER_AUTO && ownOutposts(c.team).length) dispatchCarrier(c.team);
+    return;
+  }
+  c.obs += dt;
+  if (c.obs >= 0.25) { c.obs = 0; observeInto(c.report, c.x, c.y, CARRIER_SIGHT); }
+  if (c.stage === 'out') {
+    let b = null;
+    while (c.stop < c.route.length) { b = byId(c.route[c.stop]); if (b && b.hp > 0) break; b = null; c.stop++; }
+    if (!b) { c.stage = 'back'; return; }
+    if (approach(c, b, d.speed * dt, c.r + 4)) {
+      if (!c.arrived) {
+        c.arrived = true; c.dwell = 0;
+        if (c.manifest[b.id]) { applyGroupOrder(b, c.manifest[b.id]); delete c.manifest[b.id]; }
+        observeInto(c.report, b.x, b.y, BUILDING_DEFS.barracks.sight);
+        reportGarrison(c.report, b);
+      }
+      c.dwell += dt;
+      if (c.dwell >= CARRIER_DWELL) { c.stop++; c.arrived = false; }
+    }
+  } else if (approach(c, hq, d.speed * dt, c.r + 4)) {
+    if (c.team === PLAYER) { mergeReport(S.teams[c.team].known, c.report); say('The carrier is back at HQ with fresh reports.'); }
+    Object.assign(c, { stage: 'hq', wait: 0, manifest: {}, report: newReport() });
+  }
+}
+
 // ---------- Enemy AI ----------
 function updateAI(dt) {
-  const T = ENEMY;
-  const hq = S.buildings.find(b => b.team === T && b.type === 'hq');
+  const T = ENEMY, hq = findHQ(T);
   if (!hq) return;
-  const mine = S.units.filter(u => u.team === T);
-  const workers = mine.filter(u => u.type === 'worker');
-  const soldiers = mine.filter(u => u.type === 'soldier');
-  const barracks = S.buildings.filter(b => b.team === T && b.type === 'barracks');
+  const my = S.units.filter(u => u.team === T);
+  const workers = my.filter(u => u.type === 'worker');
+  const commander = my.find(u => u.type === 'commander');
+  const outposts = S.buildings.filter(b => b.team === T && b.type === 'barracks');
 
-  // Idle workers go mine.
-  for (const w of workers) if (w.order.type === 'idle') { const m = nearestMine(w.x, w.y); if (m) w.order = { type: 'gather', mine: m }; }
-
-  // Expand production: up to 2 barracks, one at a time.
-  const constructing = mine.some(u => u.order.type === 'build') || barracks.some(b => !b.built);
-  const wantBarracks = !constructing && barracks.length < 2 && workers.length >= 4;
-  if (wantBarracks && S.gold[T] >= BUILDING_DEFS.barracks.cost) {
-    const w = workers[0];
-    for (let tries = 0; tries < 20; tries++) {
-      const x = hq.x - 110 - Math.random() * 120, y = hq.y + (Math.random() * 300 - 150);
-      if (canPlace('barracks', x, y)) { placeSite(T, 'barracks', x, y, [w]); break; }
+  // Chain outposts toward the player, one at a time.
+  const constructing = my.some(u => u.order.type === 'build') || outposts.some(b => !b.built);
+  const wantOutpost = !constructing && outposts.length < 3 && workers.length >= 4;
+  if (wantOutpost && S.gold[T] >= BUILDING_DEFS.barracks.cost) {
+    const front = [hq, ...outposts].reduce((a, b) => b.x < a.x ? b : a);
+    for (let tries = 0; tries < 30; tries++) {
+      const ang = Math.PI + (Math.random() - 0.5) * 1.6, dist = 150 + Math.random() * 100;
+      const x = front.x + Math.cos(ang) * dist, y = front.y + Math.sin(ang) * dist;
+      if (!placeFail('barracks', x, y, T)) { placeSite(T, 'barracks', x, y, [workers[0]]); break; }
     }
   }
+  if (!wantOutpost && workers.length + hq.queue.length < 6) train(hq, 'worker');
+  if (!commander && outposts.some(b => b.built) && S.gold[T] >= UNIT_DEFS.commander.cost + 60) train(hq, 'commander');
+  // The commander walks out to the front outpost as soon as it is trained.
+  if (commander && commander.group === hq.id && commander.order.type === 'idle') {
+    const built = outposts.filter(b => b.built);
+    if (built.length) transferUnit(commander, built.reduce((a, b) => b.x < a.x ? b : a));
+  }
+  for (const b of outposts) if (b.built && b.queue.length === 0) train(b, 'soldier');
 
-  // Keep a worker pool, but save up when a barracks is wanted.
-  if (!wantBarracks && workers.length + hq.queue.length < 6) train(hq, 'worker');
-  for (const b of barracks) if (b.built && b.queue.length === 0) train(b, 'soldier');
-
-  // Attack in waves: either a big group, or a smaller one after a long lull.
-  S.ai.waveTimer += dt;
-  const idle = soldiers.filter(s => s.order.type === 'idle' && !s.engage);
-  if (idle.length >= 8 || (S.ai.waveTimer > 100 && idle.length >= 4)) {
-    S.ai.waveTimer = 0;
-    const target = S.buildings.find(b => b.team === PLAYER && b.type === 'hq')
-      || S.buildings.find(b => b.team === PLAYER) || S.units.find(u => u.team === PLAYER);
-    if (target) for (const s of idle) s.order = { type: 'move', x: target.x + 70, y: target.y };
+  // Field orders go through the carrier, same as the player's.
+  const c = S.teams[T].carrier;
+  if (c && c.stage === 'hq' && outposts.some(b => b.built)) {
+    const target = findHQ(PLAYER);
+    let loaded = false;
+    for (const b of outposts) {
+      if (!b.built || !target) continue;
+      const ready = members(b).filter(u => u.order.type === 'idle' && !u.engage && Math.hypot(u.x - b.x, u.y - b.y) < 150);
+      if (ready.length >= 6) { c.manifest[b.id] = { type: 'move', x: target.x + 70, y: target.y }; loaded = true; }
+    }
+    if (loaded || c.wait >= 6) dispatchCarrier(T);
   }
 }
 
@@ -322,12 +569,22 @@ function update(dt) {
   for (const b of S.buildings) updateBuilding(b, dt);
   separate();
   updateAI(dt);
+  for (const t of [PLAYER, ENEMY]) {
+    const tm = S.teams[t];
+    if (tm.carrier && tm.carrier.hp <= 0) { tm.carrier = null; tm.carrierTimer = 0; if (t === PLAYER) say(`Your carrier was killed! A new one will be ready in ${CARRIER_RESPAWN}s.`); }
+    if (!tm.carrier) { tm.carrierTimer += dt; if (tm.carrierTimer >= CARRIER_RESPAWN && findHQ(t)) spawnCarrier(t); }
+  }
   S.units = S.units.filter(u => u.hp > 0);
   S.buildings = S.buildings.filter(b => b.hp > 0);
+  // Troops whose outpost was destroyed fall back to the nearest friendly building.
+  for (const u of S.units) if (u.group !== null && !S.buildings.some(b => b.id === u.group)) {
+    const nb = nearest(S.buildings, u.x, u.y, b => b.team === u.team && b.built);
+    u.group = nb ? nb.id : null;
+  }
   S.selected = S.selected.filter(e => e.hp > 0);
-  const pHQ = S.buildings.some(b => b.team === PLAYER && b.type === 'hq');
-  const eHQ = S.buildings.some(b => b.team === ENEMY && b.type === 'hq');
-  if (!pHQ) S.over = 'DEFEAT'; else if (!eHQ) S.over = 'VICTORY';
+  computeTerritory();
+  observeLive(PLAYER);
+  if (!findHQ(PLAYER)) S.over = 'DEFEAT'; else if (!findHQ(ENEMY)) S.over = 'VICTORY';
 }
 
 // ---------- Input ----------
@@ -337,37 +594,47 @@ function toWorld(e) {
   return { x: (e.clientX - r.left - (r.width - W * s) / 2) / s, y: (e.clientY - r.top - (r.height - H * s) / 2) / s };
 }
 
-function entityAt(x, y) {
-  for (const u of S.units) if (Math.hypot(u.x - x, u.y - y) <= u.r + 3) return u;
-  for (const b of S.buildings) if (Math.abs(b.x - x) <= b.w / 2 && Math.abs(b.y - y) <= b.h / 2) return b;
+// Things the player can click right now: live units, own buildings, mines.
+function liveAt(x, y, withCarriers) {
+  const live = S.teams[PLAYER].live;
+  for (const u of S.units) if (live.has(u.id) && (withCarriers || u.type !== 'carrier') && Math.hypot(u.x - x, u.y - y) <= u.r + 3) return u;
+  for (const b of S.buildings) if (live.has(b.id) && Math.abs(b.x - x) <= b.w / 2 && Math.abs(b.y - y) <= b.h / 2) return b;
   for (const m of S.mines) if (Math.hypot(m.x - x, m.y - y) <= m.r + 3) return m;
   return null;
 }
 
 function command(p) {
+  const outposts = S.selected.filter(e => e.kind === 'building' && e.type === 'barracks' && e.built);
   const units = S.selected.filter(e => e.kind === 'unit');
-  if (!units.length) return;
-  const target = entityAt(p.x, p.y);
-  const n = units.length, cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+  const target = liveAt(p.x, p.y, true);
+  const ownBuilding = target && target.kind === 'building' && target.team === PLAYER && target.built ? target : null;
+
+  for (const b of outposts) {
+    const order = ownBuilding ? (ownBuilding.id === b.id ? { type: 'return' } : { type: 'transfer', to: ownBuilding.id })
+                              : { type: 'move', x: p.x, y: p.y };
+    issueOutpostOrder(PLAYER, b, order);
+  }
   units.forEach((u, i) => {
     u.engage = null; u.timer = 0;
     if (target && target.kind === 'mine' && u.type === 'worker') { u.order = { type: 'gather', mine: target }; return; }
-    if (target && target.kind !== 'mine' && target.team !== u.team) { u.order = { type: 'attack', target }; return; }
-    if (target && target.kind === 'building' && target.team === u.team && !target.built && u.type === 'worker') { u.order = { type: 'build', site: target }; return; }
-    const ox = (i % cols - (cols - 1) / 2) * 20, oy = (Math.floor(i / cols) - (rows - 1) / 2) * 20;
-    u.order = { type: 'move', x: clamp(p.x + ox, u.r, W - u.r), y: clamp(p.y + oy, u.r, H - u.r) };
+    if (target && target.kind !== 'mine' && target.team !== PLAYER) { u.order = { type: 'attack', target }; return; }
+    if (target && target.kind === 'building' && target.team === PLAYER && !target.built && u.type === 'worker') { u.order = { type: 'build', site: target }; return; }
+    if (ownBuilding && u.type !== 'worker') { transferUnit(u, ownBuilding, i, units.length); return; }
+    u.order = { type: 'move', ...formation(p.x, p.y, i, units.length, u.r) };
   });
 }
 
 function act(a) {
+  if (a === 'dispatch') { dispatchCarrier(PLAYER); return; }
   if (a === 'build') {
-    if (!S.selected.some(e => e.kind === 'unit' && e.type === 'worker')) return;
+    if (!S.selected.some(e => e.kind === 'unit' && e.type === 'worker')) { say('Select a worker first.'); return; }
     if (S.gold[PLAYER] < BUILDING_DEFS.barracks.cost) say(`Not enough gold (need ${BUILDING_DEFS.barracks.cost})`);
     else S.placing = 'barracks';
-  } else {
-    const b = S.selected.find(e => e.kind === 'building' && e.built && BUILDING_DEFS[e.type].trains === a);
-    if (b) train(b, a);
+    return;
   }
+  const wanted = a === 'soldier' ? 'barracks' : 'hq';
+  const b = S.selected.find(e => e.kind === 'building' && e.built && e.type === wanted);
+  if (b) train(b, a); else say(`Select ${wanted === 'hq' ? 'the HQ' : 'an outpost'} first.`);
 }
 
 canvas.addEventListener('contextmenu', e => e.preventDefault());
@@ -395,10 +662,11 @@ window.addEventListener('mouseup', e => {
   const d = S.drag; S.drag = null;
   const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1), y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
   if (x1 - x0 < 6 && y1 - y0 < 6) {
-    const hit = entityAt(d.x0, d.y0);
+    const hit = liveAt(d.x0, d.y0, false);
     S.selected = hit && hit.team === PLAYER ? [hit] : [];
   } else {
-    S.selected = S.units.filter(u => u.team === PLAYER && u.x >= x0 && u.x <= x1 && u.y >= y0 && u.y <= y1);
+    const live = S.teams[PLAYER].live;
+    S.selected = S.units.filter(u => u.team === PLAYER && u.type !== 'carrier' && live.has(u.id) && u.x >= x0 && u.x <= x1 && u.y >= y0 && u.y <= y1);
   }
 });
 window.addEventListener('keydown', e => {
@@ -408,47 +676,77 @@ window.addEventListener('keydown', e => {
   else if (k === 'p') S.paused = !S.paused;
   else if (k === 'b') act('build');
   else if (k === 'w') act('worker');
+  else if (k === 'c') act('commander');
   else if (k === 's') act('soldier');
+  else if (k === 'd') act('dispatch');
 });
-$('panel').addEventListener('click', e => { const a = e.target.dataset.act; if (a) act(a); });
+document.addEventListener('click', e => { const a = e.target.dataset && e.target.dataset.act; if (a) act(a); });
 
 // ---------- UI ----------
-function say(text) { S.msg = text; S.msgUntil = S.t + 2.5; }
+function say(text) { S.msg = text; S.msgUntil = S.t + 3; }
 
 function refreshTop() {
-  const count = (team, type) => S.units.filter(u => u.team === team && u.type === type).length;
+  const tm = S.teams[PLAYER], c = tm.carrier;
+  const known = Object.values(tm.known);
+  const count = type => known.filter(k => k.kind === 'unit' && k.team === PLAYER && k.type === type).length;
   $('gold').textContent = S.gold[PLAYER];
-  $('counts').textContent = `Workers: ${count(PLAYER, 'worker')}   Soldiers: ${count(PLAYER, 'soldier')}   |   Enemy: ${count(ENEMY, 'worker')} workers, ${count(ENEMY, 'soldier')} soldiers`;
-  $('time').textContent = `Time ${Math.floor(S.t / 60)}:${String(Math.floor(S.t % 60)).padStart(2, '0')}${S.paused ? '  (PAUSED)' : ''}`;
+  $('counts').textContent = `Workers ${count('worker')} · Soldiers ${count('soldier')} · Commander ${count('commander')}  (as last reported)`;
+  $('time').textContent = `Time ${Math.floor(S.t / 60)}:${String(Math.floor(S.t % 60)).padStart(2, '0')}${S.paused ? ' (PAUSED)' : ''}`;
+  let ct;
+  if (!c) ct = `Carrier: lost — replacement in ${Math.ceil(CARRIER_RESPAWN - tm.carrierTimer)}s`;
+  else if (c.stage === 'hq') ct = ownOutposts(PLAYER).length ? `Carrier: at HQ — auto-dispatch in ${Math.ceil(CARRIER_AUTO - c.wait)}s` : 'Carrier: at HQ (build an outpost to use it)';
+  else if (c.stage === 'out') { const b = byId(c.route[c.stop]); ct = `Carrier: en route to ${b ? outpostName(b) : '…'}`; }
+  else ct = 'Carrier: returning to HQ with reports';
+  $('carrier').textContent = ct;
+  $('dispatch').hidden = !(c && c.stage === 'hq' && ownOutposts(PLAYER).length);
   $('msg').textContent = S.t < S.msgUntil ? S.msg : '';
 }
 
 function refreshPanel() {
-  const sel = S.selected;
-  const sig = [S.over, S.placing, ...sel.map(e => `${e.id}:${e.queue ? e.queue.length : ''}:${e.built === false ? 'c' : ''}`)].join('|');
+  const sel = S.selected, c = S.teams[PLAYER].carrier;
+  const known = Object.values(S.teams[PLAYER].known);
+  const sig = [S.over, S.placing, c && c.stage, c && Object.keys(c.manifest).join(','), known.length,
+               ...sel.map(e => `${e.id}:${e.queue ? e.queue.length : ''}:${e.built === false ? 'c' : ''}:${e.order ? e.order.type : ''}`)].join('|');
   if (sig === S.panelSig) return;
   S.panelSig = sig;
   let html;
   if (S.over) {
     html = '<span>Game over. Press R or click the map to play again.</span>';
   } else if (S.placing) {
-    html = '<span>Click on the map to place the Barracks. Right-click or Esc to cancel.</span>';
+    html = `<span>Click to place an outpost: inside your territory and within ${CHAIN_RANGE} of the HQ or another outpost. Right-click or Esc to cancel.</span>`;
   } else if (!sel.length) {
-    html = '<span>Left-drag to select units, click to select a building. Right-click: move / attack / gather / build. P pauses.</span>';
+    html = '<span class="dim">Left-drag to select units near the HQ, click a building to select it. Right-click: move / attack / gather / build. Outposts take orders through the carrier.</span>';
   } else {
-    const parts = [], count = {};
-    for (const e of sel) {
-      const n = e.kind === 'unit' ? UNIT_DEFS[e.type].name : BUILDING_DEFS[e.type].name + (e.built ? '' : ' (under construction)');
-      count[n] = (count[n] || 0) + 1;
+    const parts = [];
+    for (const b of sel.filter(e => e.kind === 'building')) {
+      if (b.type === 'hq') {
+        parts.push('<span><b>HQ</b></span>');
+        if (b.built) {
+          parts.push(`<button data-act="worker">[W] Train Worker – ${UNIT_DEFS.worker.cost}g</button>`);
+          parts.push(`<button data-act="commander">[C] Train Commander – ${UNIT_DEFS.commander.cost}g</button>`);
+        }
+      } else {
+        const g = known.filter(k => k.kind === 'unit' && k.group === b.id);
+        const tally = {};
+        for (const k of g) tally[UNIT_DEFS[k.type].name] = (tally[UNIT_DEFS[k.type].name] || 0) + 1;
+        const gtxt = g.length ? Object.entries(tally).map(([n, v]) => `${v} ${n}${v > 1 ? 's' : ''}`).join(', ') : 'none';
+        parts.push(`<span><b>${outpostName(b)}</b>${b.built ? '' : ' (under construction)'} · garrison as last reported: ${gtxt}</span>`);
+        if (b.built) {
+          parts.push(`<button data-act="soldier">[S] Train Soldier – ${UNIT_DEFS.soldier.cost}g</button>`);
+          const pending = c && c.stage === 'hq' && c.manifest[b.id];
+          parts.push(`<span class="dim">Pending order: ${pending ? describeOrder(pending) : 'none'} · Last delivered: ${describeOrder(b.order)}</span>`);
+          parts.push('<span class="dim">Right-click map = attack-move · this outpost = recall · another building = transfer</span>');
+        }
+      }
+      if (b.queue.length) parts.push(`<span>Queue ${b.queue.length}/${MAX_QUEUE}</span>`);
     }
-    parts.push(`<span>Selected: ${Object.entries(count).map(([n, c]) => c > 1 ? `${c} ${n}s` : n).join(', ')}</span>`);
-    if (sel.some(e => e.kind === 'unit' && e.type === 'worker'))
-      parts.push(`<button data-act="build">[B] Build Barracks – ${BUILDING_DEFS.barracks.cost}g</button>`);
-    for (const b of sel) {
-      if (b.kind !== 'building' || !b.built) continue;
-      const d = BUILDING_DEFS[b.type], u = UNIT_DEFS[d.trains];
-      parts.push(`<button data-act="${d.trains}">[${d.key}] Train ${u.name} – ${u.cost}g</button>`);
-      if (b.queue.length) parts.push(`<span>Queue: ${b.queue.length}/${MAX_QUEUE}</span>`);
+    const units = sel.filter(e => e.kind === 'unit');
+    if (units.length) {
+      const tally = {};
+      for (const u of units) tally[UNIT_DEFS[u.type].name] = (tally[UNIT_DEFS[u.type].name] || 0) + 1;
+      parts.push(`<span>Selected: ${Object.entries(tally).map(([n, v]) => v > 1 ? `${v} ${n}s` : n).join(', ')}</span>`);
+      if (units.some(u => u.type === 'worker')) parts.push(`<button data-act="build">[B] Build Outpost – ${BUILDING_DEFS.barracks.cost}g</button>`);
+      if (units.some(u => u.type !== 'worker')) parts.push('<span class="dim">Right-click an outpost to station these troops there</span>');
     }
     html = parts.join('');
   }
@@ -461,68 +759,126 @@ function bar(cx, y, w, frac, fg, bg) {
   ctx.fillStyle = fg; ctx.fillRect(cx - w / 2, y, w * clamp(frac, 0, 1), 4);
 }
 
+function drawTerritory() {
+  const px = terrImg.data;
+  for (let i = 0; i < GW * GH; i++) {
+    const t = S.terr[i], o = i * 4;
+    if (t < 0) { px[o + 3] = 0; continue; }
+    px[o] = TEAM_RGB[t][0]; px[o + 1] = TEAM_RGB[t][1]; px[o + 2] = TEAM_RGB[t][2]; px[o + 3] = 80;
+  }
+  terrCtx.putImageData(terrImg, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(terrCanvas, 0, 0, W, H);
+}
+
+function drawBuilding(v, live) {
+  const sel = S.selected.includes(v.ref);
+  ctx.globalAlpha = (live ? 1 : 0.45) * (v.built ? 1 : 0.6);
+  ctx.fillStyle = TEAM_COLOR[v.team];
+  ctx.fillRect(v.x - v.w / 2, v.y - v.h / 2, v.w, v.h);
+  ctx.globalAlpha = live ? 1 : 0.6;
+  ctx.strokeStyle = sel ? '#fff' : 'rgba(0,0,0,0.5)'; ctx.lineWidth = sel ? 2 : 1;
+  ctx.strokeRect(v.x - v.w / 2, v.y - v.h / 2, v.w, v.h);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 12px system-ui'; ctx.textBaseline = 'middle';
+  ctx.fillText(v.type === 'hq' ? 'HQ' : v.team === PLAYER ? `Outpost ${v.num}` : 'Enemy post', v.x, v.y);
+  ctx.textBaseline = 'alphabetic';
+  if (v.hp < v.maxHp) bar(v.x, v.y - v.h / 2 - 8, v.w, v.hp / v.maxHp, '#4c4', '#c33');
+  if (!v.built) bar(v.x, v.y + v.h / 2 + 4, v.w, v.progress, '#ddd', '#444');
+  else if (v.queue) bar(v.x, v.y + v.h / 2 + 4, v.w, v.qFrac, '#ddd', '#444');
+  ctx.globalAlpha = 1;
+}
+
+function drawUnit(v, live) {
+  const sel = S.selected.includes(v.ref);
+  ctx.globalAlpha = live ? 1 : 0.45;
+  if (sel) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(v.x, v.y, v.r + 3, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.fillStyle = v.type === 'carrier' ? '#fff' : TEAM_COLOR[v.team];
+  ctx.beginPath();
+  if (v.type === 'soldier') {
+    ctx.moveTo(v.x, v.y - v.r - 1); ctx.lineTo(v.x + v.r + 1, v.y + v.r - 1); ctx.lineTo(v.x - v.r - 1, v.y + v.r - 1); ctx.closePath();
+  } else if (v.type === 'commander') {
+    for (let i = 0; i < 5; i++) { const a = -Math.PI / 2 + i * Math.PI * 2 / 5; ctx.lineTo(v.x + Math.cos(a) * (v.r + 2), v.y + Math.sin(a) * (v.r + 2)); }
+    ctx.closePath();
+  } else if (v.type === 'carrier') {
+    ctx.moveTo(v.x, v.y - 8); ctx.lineTo(v.x + 5, v.y); ctx.lineTo(v.x, v.y + 8); ctx.lineTo(v.x - 5, v.y); ctx.closePath();
+  } else {
+    ctx.arc(v.x, v.y, v.r, 0, Math.PI * 2);
+  }
+  ctx.fill();
+  ctx.strokeStyle = v.type === 'carrier' ? TEAM_COLOR[v.team] : 'rgba(0,0,0,0.6)'; ctx.lineWidth = v.type === 'carrier' ? 2 : 1; ctx.stroke();
+  if (v.carry > 0) { ctx.fillStyle = '#ffd54a'; ctx.beginPath(); ctx.arc(v.x, v.y, 3, 0, Math.PI * 2); ctx.fill(); }
+  if (v.hp < v.maxHp) bar(v.x, v.y - v.r - 7, 20, v.hp / v.maxHp, '#4c4', '#c33');
+  const e = v.ref;
+  if (live && e.hit && S.t < e.hit.until) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(e.x, e.y); ctx.lineTo(e.hit.x, e.hit.y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawOrderLine(b, o, pending) {
+  let tx, ty;
+  if (o.type === 'move') { tx = o.x; ty = o.y; }
+  else if (o.type === 'transfer') { const d = byId(o.to); if (!d) return; tx = d.x; ty = d.y; }
+  else return;
+  ctx.setLineDash(pending ? [6, 6] : [2, 6]);
+  ctx.strokeStyle = pending ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.3)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(tx, ty); ctx.stroke();
+  ctx.setLineDash([]);
+  if (o.type === 'move') { ctx.beginPath(); ctx.arc(tx, ty, 6, 0, Math.PI * 2); ctx.stroke(); }
+}
+
+function circle(x, y, r, style, dash) {
+  ctx.setLineDash(dash || []); ctx.strokeStyle = style; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
 function draw() {
-  ctx.fillStyle = '#2b4a2b'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#2b3b2b'; ctx.fillRect(0, 0, W, H);
+  drawTerritory();
   ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
   ctx.beginPath();
   for (let x = 0; x <= W; x += 50) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
   for (let y = 0; y <= H; y += 50) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
   ctx.stroke();
 
+  const tm = S.teams[PLAYER], known = Object.values(tm.known), live = tm.live, hq = findHQ(PLAYER), c = tm.carrier;
+  if (hq) circle(hq.x, hq.y, BUILDING_DEFS.hq.sight, 'rgba(255,255,255,0.18)', [4, 8]);
+  for (const b of S.selected) if (b.kind === 'building' && b.type === 'barracks' && b.built) circle(b.x, b.y, BUILDING_DEFS.barracks.sight, 'rgba(255,255,255,0.18)', [4, 8]);
+
   ctx.textAlign = 'center';
   for (const m of S.mines) {
-    ctx.fillStyle = m.gold > 0 ? '#e0b030' : '#666';
+    const o = owner(m.x, m.y);
+    ctx.fillStyle = m.gold > 0 ? (o === PLAYER ? '#e0b030' : '#9c8440') : '#666';
     ctx.beginPath();
     ctx.moveTo(m.x, m.y - m.r); ctx.lineTo(m.x + m.r, m.y); ctx.lineTo(m.x, m.y + m.r); ctx.lineTo(m.x - m.r, m.y);
     ctx.closePath(); ctx.fill();
+    if (o >= 0) { ctx.strokeStyle = TEAM_COLOR[o]; ctx.lineWidth = 2; ctx.stroke(); }
     ctx.fillStyle = '#fff'; ctx.font = '11px system-ui';
     ctx.fillText(m.gold, m.x, m.y + m.r + 12);
   }
 
   if (S.placing) {
     const d = BUILDING_DEFS[S.placing];
-    const ok = canPlace(S.placing, S.mouse.x, S.mouse.y) && S.gold[PLAYER] >= d.cost;
-    ctx.fillStyle = ok ? 'rgba(74,158,255,0.4)' : 'rgba(255,80,80,0.4)';
+    for (const b of S.buildings) if (b.team === PLAYER) circle(b.x, b.y, CHAIN_RANGE, 'rgba(255,255,255,0.25)', [3, 5]);
+    const ok = !placeFail(S.placing, S.mouse.x, S.mouse.y, PLAYER) && S.gold[PLAYER] >= d.cost;
+    ctx.fillStyle = ok ? 'rgba(74,158,255,0.45)' : 'rgba(255,80,80,0.45)';
     ctx.fillRect(S.mouse.x - d.w / 2, S.mouse.y - d.h / 2, d.w, d.h);
+    circle(S.mouse.x, S.mouse.y, d.terr, ok ? 'rgba(74,158,255,0.5)' : 'rgba(255,80,80,0.5)');
   }
 
-  for (const b of S.buildings) {
-    const sel = S.selected.includes(b);
-    ctx.globalAlpha = b.built ? 1 : 0.5;
-    ctx.fillStyle = TEAM_COLOR[b.team];
-    ctx.fillRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h);
-    ctx.globalAlpha = 1;
-    ctx.strokeStyle = sel ? '#fff' : 'rgba(0,0,0,0.5)'; ctx.lineWidth = sel ? 2 : 1;
-    ctx.strokeRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h);
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 13px system-ui'; ctx.textBaseline = 'middle';
-    ctx.fillText(BUILDING_DEFS[b.type].name, b.x, b.y);
-    ctx.textBaseline = 'alphabetic';
-    if (b.hp < b.maxHp) bar(b.x, b.y - b.h / 2 - 8, b.w, b.hp / b.maxHp, '#4c4', '#c33');
-    if (!b.built) bar(b.x, b.y + b.h / 2 + 4, b.w, b.progress, '#ddd', '#444');
-    else if (b.queue.length) bar(b.x, b.y + b.h / 2 + 4, b.w, b.qTime / UNIT_DEFS[b.queue[0]].time, '#ddd', '#444');
+  if (c) {
+    for (const id in c.manifest) { const b = byId(+id); if (b) drawOrderLine(b, c.manifest[id], true); }
+    if (c.stage !== 'hq') {
+      const next = c.stage === 'out' ? byId(c.route[c.stop]) : hq;
+      if (next) { ctx.setLineDash([3, 5]); ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(next.x, next.y); ctx.stroke(); ctx.setLineDash([]); }
+    }
   }
+  for (const b of S.buildings) if (b.team === PLAYER && b.order && !(c && c.manifest[b.id])) drawOrderLine(b, b.order, false);
 
-  for (const u of S.units) {
-    if (S.selected.includes(u)) {
-      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.arc(u.x, u.y, u.r + 3, 0, Math.PI * 2); ctx.stroke();
-    }
-    ctx.fillStyle = TEAM_COLOR[u.team];
-    ctx.beginPath();
-    if (u.type === 'soldier') {
-      ctx.moveTo(u.x, u.y - u.r - 1); ctx.lineTo(u.x + u.r + 1, u.y + u.r - 1); ctx.lineTo(u.x - u.r - 1, u.y + u.r - 1); ctx.closePath();
-    } else {
-      ctx.arc(u.x, u.y, u.r, 0, Math.PI * 2);
-    }
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1; ctx.stroke();
-    if (u.carry > 0) { ctx.fillStyle = '#ffd54a'; ctx.beginPath(); ctx.arc(u.x, u.y, 3, 0, Math.PI * 2); ctx.fill(); }
-    if (u.hp < u.maxHp) bar(u.x, u.y - u.r - 7, 20, u.hp / u.maxHp, '#4c4', '#c33');
-    if (u.hit && S.t < u.hit.until) {
-      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.moveTo(u.x, u.y); ctx.lineTo(u.hit.x, u.hit.y); ctx.stroke();
-    }
-  }
+  for (const v of known) if (v.kind === 'building') drawBuilding(v, live.has(v.id));
+  for (const v of known) if (v.kind === 'unit') drawUnit(v, live.has(v.id));
 
   if (S.drag) {
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
