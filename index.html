@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini RTS</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: system-ui, sans-serif; overflow: hidden; }
+  #wrap { display: flex; flex-direction: column; height: 100%; }
+  #top { display: flex; gap: 24px; padding: 6px 12px; background: #1b1b1b; font-size: 14px; white-space: nowrap; }
+  #top b { color: #ffd54a; }
+  #msg { color: #ffb347; }
+  #game { flex: 1; min-height: 0; width: 100%; object-fit: contain; display: block; cursor: crosshair; background: #000; }
+  #panel { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 12px; background: #1b1b1b; font-size: 13px; min-height: 26px; }
+  #panel button { background: #333; color: #eee; border: 1px solid #555; border-radius: 3px; padding: 3px 8px; cursor: pointer; font-size: 13px; }
+  #panel button:hover { background: #444; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <span>Gold: <b id="gold">0</b></span>
+    <span id="counts"></span>
+    <span id="time"></span>
+    <span id="msg"></span>
+  </div>
+  <canvas id="game"></canvas>
+  <div id="panel"></div>
+</div>
+<script>
+'use strict';
+
+// ---------- Constants ----------
+const W = 1200, H = 700;
+const PLAYER = 0, ENEMY = 1;
+const TEAM_COLOR = ['#4a9eff', '#ff5555'];
+
+const UNIT_DEFS = {
+  worker:  { name: 'Worker',  hp: 30, speed: 90, r: 7, cost: 50, time: 6, dmg: 2, range: 14, aggro: 0,   cd: 1.0 },
+  soldier: { name: 'Soldier', hp: 60, speed: 75, r: 8, cost: 60, time: 5, dmg: 8, range: 18, aggro: 130, cd: 0.8 },
+};
+const BUILDING_DEFS = {
+  hq:       { name: 'HQ',       hp: 800, w: 70, h: 70, cost: 0,   buildTime: 0,  trains: 'worker',  key: 'W' },
+  barracks: { name: 'Barracks', hp: 350, w: 56, h: 56, cost: 100, buildTime: 15, trains: 'soldier', key: 'S' },
+};
+const MINE_R = 16, GATHER_TIME = 1.5, CARRY = 10, MAX_QUEUE = 5;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.width = W; canvas.height = H;
+const $ = id => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+let S; // game state
+
+// ---------- Setup ----------
+function newGame() {
+  S = {
+    t: 0, nextId: 1, gold: [150, 150],
+    units: [], buildings: [], mines: [],
+    selected: [], placing: null, drag: null, mouse: { x: 0, y: 0 },
+    msg: '', msgUntil: 0, over: null, paused: false, ai: { waveTimer: 0 }, panelSig: null,
+  };
+  addBuilding(PLAYER, 'hq', 120, H / 2, true);
+  addBuilding(ENEMY, 'hq', W - 120, H / 2, true);
+  const mine = (x, y, gold) => S.mines.push({ id: S.nextId++, kind: 'mine', x, y, r: MINE_R, gold });
+  mine(140, 150, 1500); mine(140, H - 150, 1500);
+  mine(W - 140, 150, 1500); mine(W - 140, H - 150, 1500);
+  mine(W / 2, H / 2, 4000);
+  for (let i = 0; i < 3; i++) {
+    for (const [team, x] of [[PLAYER, 190], [ENEMY, W - 190]]) {
+      const u = addUnit(team, 'worker', x, H / 2 - 30 + i * 30);
+      u.order = { type: 'gather', mine: nearestMine(u.x, u.y) };
+    }
+  }
+}
+
+function addUnit(team, type, x, y) {
+  const d = UNIT_DEFS[type];
+  const u = { id: S.nextId++, kind: 'unit', team, type, x, y, r: d.r, hp: d.hp, maxHp: d.hp,
+              order: { type: 'idle' }, engage: null, carry: 0, timer: 0, cd: 0, hit: null };
+  S.units.push(u);
+  return u;
+}
+
+function addBuilding(team, type, x, y, built) {
+  const d = BUILDING_DEFS[type];
+  const b = { id: S.nextId++, kind: 'building', team, type, x, y, w: d.w, h: d.h,
+              hp: built ? d.hp : 1, maxHp: d.hp, built, progress: built ? 1 : 0, queue: [], qTime: 0 };
+  S.buildings.push(b);
+  return b;
+}
+
+// ---------- Geometry helpers ----------
+function edgeDist(x, y, e) {
+  if (e.kind === 'building') {
+    const dx = Math.max(Math.abs(x - e.x) - e.w / 2, 0), dy = Math.max(Math.abs(y - e.y) - e.h / 2, 0);
+    return Math.hypot(dx, dy);
+  }
+  return Math.hypot(e.x - x, e.y - y) - e.r;
+}
+
+function moveToward(u, x, y, step) {
+  const dx = x - u.x, dy = y - u.y, dist = Math.hypot(dx, dy);
+  if (dist <= step) { u.x = x; u.y = y; return true; }
+  u.x += dx / dist * step; u.y += dy / dist * step;
+  return false;
+}
+
+// Walk toward an entity; returns true once within `within` of its edge.
+function approach(u, e, step, within) {
+  if (edgeDist(u.x, u.y, e) <= within) return true;
+  moveToward(u, e.x, e.y, step);
+  return false;
+}
+
+function nearest(list, x, y, filter) {
+  let best = null, bd = Infinity;
+  for (const e of list) {
+    if (filter && !filter(e)) continue;
+    const d = edgeDist(x, y, e);
+    if (d < bd) { bd = d; best = e; }
+  }
+  return best;
+}
+const nearestMine = (x, y) => nearest(S.mines, x, y, m => m.gold > 0);
+const nearestHQ = (team, x, y) => nearest(S.buildings, x, y, b => b.team === team && b.type === 'hq' && b.built);
+
+function nearestEnemy(u, range) {
+  let best = null, bd = Infinity;
+  for (const e of [...S.units, ...S.buildings]) {
+    if (e.team === u.team || e.hp <= 0) continue;
+    const d = edgeDist(u.x, u.y, e);
+    if (d > range) continue;
+    const score = d + (e.kind === 'building' ? 40 : 0); // prefer units over buildings
+    if (score < bd) { bd = score; best = e; }
+  }
+  return best;
+}
+
+// ---------- Units ----------
+function updateUnit(u, dt) {
+  const d = UNIT_DEFS[u.type];
+  u.cd = Math.max(0, u.cd - dt);
+
+  // Soldiers automatically fight anything that comes near while idle or moving.
+  if (d.aggro > 0) {
+    if (u.engage && (u.engage.hp <= 0 || edgeDist(u.x, u.y, u.engage) > d.aggro * 1.5)) u.engage = null;
+    if (!u.engage && (u.order.type === 'idle' || u.order.type === 'move')) u.engage = nearestEnemy(u, d.aggro);
+    if (u.engage) { attack(u, u.engage, d, dt); return; }
+  }
+
+  const o = u.order;
+  if (o.type === 'move') {
+    if (moveToward(u, o.x, o.y, d.speed * dt)) u.order = { type: 'idle' };
+  } else if (o.type === 'attack') {
+    if (o.target.hp <= 0) u.order = { type: 'idle' }; else attack(u, o.target, d, dt);
+  } else if (o.type === 'gather') {
+    gather(u, o, d, dt);
+  } else if (o.type === 'build') {
+    build(u, o, d, dt);
+  }
+}
+
+function attack(u, target, d, dt) {
+  if (approach(u, target, d.speed * dt, d.range) && u.cd <= 0) {
+    u.cd = d.cd;
+    target.hp -= d.dmg;
+    u.hit = { x: target.x, y: target.y, until: S.t + 0.12 };
+  }
+}
+
+function gather(u, o, d, dt) {
+  if (u.carry >= CARRY || (u.carry > 0 && o.mine.gold <= 0)) {
+    const hq = nearestHQ(u.team, u.x, u.y);
+    if (!hq) { u.order = { type: 'idle' }; return; }
+    if (approach(u, hq, d.speed * dt, u.r + 4)) { S.gold[u.team] += u.carry; u.carry = 0; }
+    return;
+  }
+  if (o.mine.gold <= 0) {
+    const m = nearestMine(u.x, u.y);
+    if (m) o.mine = m; else u.order = { type: 'idle' };
+    return;
+  }
+  if (approach(u, o.mine, d.speed * dt, u.r + 4)) {
+    u.timer += dt;
+    if (u.timer >= GATHER_TIME) {
+      u.timer = 0;
+      const take = Math.min(CARRY, o.mine.gold);
+      o.mine.gold -= take; u.carry += take;
+    }
+  }
+}
+
+function build(u, o, d, dt) {
+  const b = o.site;
+  if (b.hp <= 0 || b.built) { u.order = { type: 'idle' }; return; }
+  if (approach(u, b, d.speed * dt, u.r + 6)) {
+    const bt = BUILDING_DEFS[b.type].buildTime;
+    b.progress = Math.min(1, b.progress + dt / bt);
+    b.hp = Math.min(b.maxHp, b.hp + b.maxHp * dt / bt);
+    if (b.progress >= 1) {
+      b.built = true; b.hp = b.maxHp;
+      const m = nearestMine(u.x, u.y);
+      u.order = m ? { type: 'gather', mine: m } : { type: 'idle' };
+    }
+  }
+}
+
+// Keep units from overlapping each other, buildings, or the map edge.
+function separate() {
+  const us = S.units;
+  for (let i = 0; i < us.length; i++) {
+    for (let j = i + 1; j < us.length; j++) {
+      const a = us[i], b = us[j], min = a.r + b.r;
+      let dx = b.x - a.x, dy = b.y - a.y;
+      if (Math.abs(dx) >= min || Math.abs(dy) >= min) continue;
+      let dist = Math.hypot(dx, dy);
+      if (dist < 0.01) { dx = 0.01; dy = 0; dist = 0.01; }
+      if (dist >= min) continue;
+      const push = (min - dist) / 2, nx = dx / dist, ny = dy / dist;
+      a.x -= nx * push; a.y -= ny * push; b.x += nx * push; b.y += ny * push;
+    }
+  }
+  for (const u of us) {
+    for (const b of S.buildings) {
+      const ox = b.w / 2 + u.r - Math.abs(u.x - b.x), oy = b.h / 2 + u.r - Math.abs(u.y - b.y);
+      if (ox > 0 && oy > 0) {
+        if (ox < oy) u.x += Math.sign(u.x - b.x || 1) * ox; else u.y += Math.sign(u.y - b.y || 1) * oy;
+      }
+    }
+    u.x = clamp(u.x, u.r, W - u.r); u.y = clamp(u.y, u.r, H - u.r);
+  }
+}
+
+// ---------- Buildings ----------
+function updateBuilding(b, dt) {
+  if (!b.built || !b.queue.length) return;
+  const type = b.queue[0];
+  b.qTime += dt;
+  if (b.qTime >= UNIT_DEFS[type].time) {
+    b.qTime = 0; b.queue.shift();
+    const dir = b.team === PLAYER ? 1 : -1;
+    const u = addUnit(b.team, type, b.x + dir * (b.w / 2 + 12), b.y + (Math.random() * 40 - 20));
+    if (type === 'worker') { const m = nearestMine(u.x, u.y); if (m) u.order = { type: 'gather', mine: m }; }
+  }
+}
+
+function train(b, type) {
+  const d = UNIT_DEFS[type];
+  if (!b.built || b.queue.length >= MAX_QUEUE) return false;
+  if (S.gold[b.team] < d.cost) { if (b.team === PLAYER) say(`Not enough gold (need ${d.cost})`); return false; }
+  S.gold[b.team] -= d.cost;
+  b.queue.push(type);
+  return true;
+}
+
+function canPlace(type, x, y) {
+  const d = BUILDING_DEFS[type];
+  if (x - d.w / 2 < 10 || y - d.h / 2 < 10 || x + d.w / 2 > W - 10 || y + d.h / 2 > H - 10) return false;
+  for (const b of S.buildings)
+    if (Math.abs(b.x - x) < (b.w + d.w) / 2 + 10 && Math.abs(b.y - y) < (b.h + d.h) / 2 + 10) return false;
+  for (const m of S.mines)
+    if (Math.abs(m.x - x) < d.w / 2 + m.r + 10 && Math.abs(m.y - y) < d.h / 2 + m.r + 10) return false;
+  return true;
+}
+
+function placeSite(team, type, x, y, builders) {
+  const d = BUILDING_DEFS[type];
+  if (S.gold[team] < d.cost) { if (team === PLAYER) say(`Not enough gold (need ${d.cost})`); return null; }
+  if (!canPlace(type, x, y)) { if (team === PLAYER) say("Can't build there"); return null; }
+  S.gold[team] -= d.cost;
+  const site = addBuilding(team, type, x, y, false);
+  for (const u of builders) { u.engage = null; u.order = { type: 'build', site }; }
+  return site;
+}
+
+// ---------- Enemy AI ----------
+function updateAI(dt) {
+  const T = ENEMY;
+  const hq = S.buildings.find(b => b.team === T && b.type === 'hq');
+  if (!hq) return;
+  const mine = S.units.filter(u => u.team === T);
+  const workers = mine.filter(u => u.type === 'worker');
+  const soldiers = mine.filter(u => u.type === 'soldier');
+  const barracks = S.buildings.filter(b => b.team === T && b.type === 'barracks');
+
+  // Idle workers go mine.
+  for (const w of workers) if (w.order.type === 'idle') { const m = nearestMine(w.x, w.y); if (m) w.order = { type: 'gather', mine: m }; }
+
+  // Expand production: up to 2 barracks, one at a time.
+  const constructing = mine.some(u => u.order.type === 'build') || barracks.some(b => !b.built);
+  const wantBarracks = !constructing && barracks.length < 2 && workers.length >= 4;
+  if (wantBarracks && S.gold[T] >= BUILDING_DEFS.barracks.cost) {
+    const w = workers[0];
+    for (let tries = 0; tries < 20; tries++) {
+      const x = hq.x - 110 - Math.random() * 120, y = hq.y + (Math.random() * 300 - 150);
+      if (canPlace('barracks', x, y)) { placeSite(T, 'barracks', x, y, [w]); break; }
+    }
+  }
+
+  // Keep a worker pool, but save up when a barracks is wanted.
+  if (!wantBarracks && workers.length + hq.queue.length < 6) train(hq, 'worker');
+  for (const b of barracks) if (b.built && b.queue.length === 0) train(b, 'soldier');
+
+  // Attack in waves: either a big group, or a smaller one after a long lull.
+  S.ai.waveTimer += dt;
+  const idle = soldiers.filter(s => s.order.type === 'idle' && !s.engage);
+  if (idle.length >= 8 || (S.ai.waveTimer > 100 && idle.length >= 4)) {
+    S.ai.waveTimer = 0;
+    const target = S.buildings.find(b => b.team === PLAYER && b.type === 'hq')
+      || S.buildings.find(b => b.team === PLAYER) || S.units.find(u => u.team === PLAYER);
+    if (target) for (const s of idle) s.order = { type: 'move', x: target.x + 70, y: target.y };
+  }
+}
+
+// ---------- Main update ----------
+function update(dt) {
+  if (S.over || S.paused) return;
+  S.t += dt;
+  for (const u of S.units) updateUnit(u, dt);
+  for (const b of S.buildings) updateBuilding(b, dt);
+  separate();
+  updateAI(dt);
+  S.units = S.units.filter(u => u.hp > 0);
+  S.buildings = S.buildings.filter(b => b.hp > 0);
+  S.selected = S.selected.filter(e => e.hp > 0);
+  const pHQ = S.buildings.some(b => b.team === PLAYER && b.type === 'hq');
+  const eHQ = S.buildings.some(b => b.team === ENEMY && b.type === 'hq');
+  if (!pHQ) S.over = 'DEFEAT'; else if (!eHQ) S.over = 'VICTORY';
+}
+
+// ---------- Input ----------
+function toWorld(e) {
+  const r = canvas.getBoundingClientRect();
+  const s = Math.min(r.width / W, r.height / H);
+  return { x: (e.clientX - r.left - (r.width - W * s) / 2) / s, y: (e.clientY - r.top - (r.height - H * s) / 2) / s };
+}
+
+function entityAt(x, y) {
+  for (const u of S.units) if (Math.hypot(u.x - x, u.y - y) <= u.r + 3) return u;
+  for (const b of S.buildings) if (Math.abs(b.x - x) <= b.w / 2 && Math.abs(b.y - y) <= b.h / 2) return b;
+  for (const m of S.mines) if (Math.hypot(m.x - x, m.y - y) <= m.r + 3) return m;
+  return null;
+}
+
+function command(p) {
+  const units = S.selected.filter(e => e.kind === 'unit');
+  if (!units.length) return;
+  const target = entityAt(p.x, p.y);
+  const n = units.length, cols = Math.ceil(Math.sqrt(n)), rows = Math.ceil(n / cols);
+  units.forEach((u, i) => {
+    u.engage = null; u.timer = 0;
+    if (target && target.kind === 'mine' && u.type === 'worker') { u.order = { type: 'gather', mine: target }; return; }
+    if (target && target.kind !== 'mine' && target.team !== u.team) { u.order = { type: 'attack', target }; return; }
+    if (target && target.kind === 'building' && target.team === u.team && !target.built && u.type === 'worker') { u.order = { type: 'build', site: target }; return; }
+    const ox = (i % cols - (cols - 1) / 2) * 20, oy = (Math.floor(i / cols) - (rows - 1) / 2) * 20;
+    u.order = { type: 'move', x: clamp(p.x + ox, u.r, W - u.r), y: clamp(p.y + oy, u.r, H - u.r) };
+  });
+}
+
+function act(a) {
+  if (a === 'build') {
+    if (!S.selected.some(e => e.kind === 'unit' && e.type === 'worker')) return;
+    if (S.gold[PLAYER] < BUILDING_DEFS.barracks.cost) say(`Not enough gold (need ${BUILDING_DEFS.barracks.cost})`);
+    else S.placing = 'barracks';
+  } else {
+    const b = S.selected.find(e => e.kind === 'building' && e.built && BUILDING_DEFS[e.type].trains === a);
+    if (b) train(b, a);
+  }
+}
+
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousedown', e => {
+  const p = toWorld(e);
+  if (S.over) { if (e.button === 0) newGame(); return; }
+  if (e.button === 0) {
+    if (S.placing) {
+      const builders = S.selected.filter(u => u.kind === 'unit' && u.type === 'worker');
+      if (placeSite(PLAYER, S.placing, p.x, p.y, builders)) S.placing = null;
+      return;
+    }
+    S.drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+  } else if (e.button === 2) {
+    if (S.placing) { S.placing = null; return; }
+    command(p);
+  }
+});
+canvas.addEventListener('mousemove', e => {
+  S.mouse = toWorld(e);
+  if (S.drag) { S.drag.x1 = S.mouse.x; S.drag.y1 = S.mouse.y; }
+});
+window.addEventListener('mouseup', e => {
+  if (e.button !== 0 || !S.drag) return;
+  const d = S.drag; S.drag = null;
+  const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1), y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+  if (x1 - x0 < 6 && y1 - y0 < 6) {
+    const hit = entityAt(d.x0, d.y0);
+    S.selected = hit && hit.team === PLAYER ? [hit] : [];
+  } else {
+    S.selected = S.units.filter(u => u.team === PLAYER && u.x >= x0 && u.x <= x1 && u.y >= y0 && u.y <= y1);
+  }
+});
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (S.over) { if (k === 'r') newGame(); return; }
+  if (k === 'escape') { S.placing = null; S.selected = []; }
+  else if (k === 'p') S.paused = !S.paused;
+  else if (k === 'b') act('build');
+  else if (k === 'w') act('worker');
+  else if (k === 's') act('soldier');
+});
+$('panel').addEventListener('click', e => { const a = e.target.dataset.act; if (a) act(a); });
+
+// ---------- UI ----------
+function say(text) { S.msg = text; S.msgUntil = S.t + 2.5; }
+
+function refreshTop() {
+  const count = (team, type) => S.units.filter(u => u.team === team && u.type === type).length;
+  $('gold').textContent = S.gold[PLAYER];
+  $('counts').textContent = `Workers: ${count(PLAYER, 'worker')}   Soldiers: ${count(PLAYER, 'soldier')}   |   Enemy: ${count(ENEMY, 'worker')} workers, ${count(ENEMY, 'soldier')} soldiers`;
+  $('time').textContent = `Time ${Math.floor(S.t / 60)}:${String(Math.floor(S.t % 60)).padStart(2, '0')}${S.paused ? '  (PAUSED)' : ''}`;
+  $('msg').textContent = S.t < S.msgUntil ? S.msg : '';
+}
+
+function refreshPanel() {
+  const sel = S.selected;
+  const sig = [S.over, S.placing, ...sel.map(e => `${e.id}:${e.queue ? e.queue.length : ''}:${e.built === false ? 'c' : ''}`)].join('|');
+  if (sig === S.panelSig) return;
+  S.panelSig = sig;
+  let html;
+  if (S.over) {
+    html = '<span>Game over. Press R or click the map to play again.</span>';
+  } else if (S.placing) {
+    html = '<span>Click on the map to place the Barracks. Right-click or Esc to cancel.</span>';
+  } else if (!sel.length) {
+    html = '<span>Left-drag to select units, click to select a building. Right-click: move / attack / gather / build. P pauses.</span>';
+  } else {
+    const parts = [], count = {};
+    for (const e of sel) {
+      const n = e.kind === 'unit' ? UNIT_DEFS[e.type].name : BUILDING_DEFS[e.type].name + (e.built ? '' : ' (under construction)');
+      count[n] = (count[n] || 0) + 1;
+    }
+    parts.push(`<span>Selected: ${Object.entries(count).map(([n, c]) => c > 1 ? `${c} ${n}s` : n).join(', ')}</span>`);
+    if (sel.some(e => e.kind === 'unit' && e.type === 'worker'))
+      parts.push(`<button data-act="build">[B] Build Barracks – ${BUILDING_DEFS.barracks.cost}g</button>`);
+    for (const b of sel) {
+      if (b.kind !== 'building' || !b.built) continue;
+      const d = BUILDING_DEFS[b.type], u = UNIT_DEFS[d.trains];
+      parts.push(`<button data-act="${d.trains}">[${d.key}] Train ${u.name} – ${u.cost}g</button>`);
+      if (b.queue.length) parts.push(`<span>Queue: ${b.queue.length}/${MAX_QUEUE}</span>`);
+    }
+    html = parts.join('');
+  }
+  $('panel').innerHTML = html;
+}
+
+// ---------- Rendering ----------
+function bar(cx, y, w, frac, fg, bg) {
+  ctx.fillStyle = bg; ctx.fillRect(cx - w / 2, y, w, 4);
+  ctx.fillStyle = fg; ctx.fillRect(cx - w / 2, y, w * clamp(frac, 0, 1), 4);
+}
+
+function draw() {
+  ctx.fillStyle = '#2b4a2b'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 50) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y <= H; y += 50) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  for (const m of S.mines) {
+    ctx.fillStyle = m.gold > 0 ? '#e0b030' : '#666';
+    ctx.beginPath();
+    ctx.moveTo(m.x, m.y - m.r); ctx.lineTo(m.x + m.r, m.y); ctx.lineTo(m.x, m.y + m.r); ctx.lineTo(m.x - m.r, m.y);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '11px system-ui';
+    ctx.fillText(m.gold, m.x, m.y + m.r + 12);
+  }
+
+  if (S.placing) {
+    const d = BUILDING_DEFS[S.placing];
+    const ok = canPlace(S.placing, S.mouse.x, S.mouse.y) && S.gold[PLAYER] >= d.cost;
+    ctx.fillStyle = ok ? 'rgba(74,158,255,0.4)' : 'rgba(255,80,80,0.4)';
+    ctx.fillRect(S.mouse.x - d.w / 2, S.mouse.y - d.h / 2, d.w, d.h);
+  }
+
+  for (const b of S.buildings) {
+    const sel = S.selected.includes(b);
+    ctx.globalAlpha = b.built ? 1 : 0.5;
+    ctx.fillStyle = TEAM_COLOR[b.team];
+    ctx.fillRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = sel ? '#fff' : 'rgba(0,0,0,0.5)'; ctx.lineWidth = sel ? 2 : 1;
+    ctx.strokeRect(b.x - b.w / 2, b.y - b.h / 2, b.w, b.h);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 13px system-ui'; ctx.textBaseline = 'middle';
+    ctx.fillText(BUILDING_DEFS[b.type].name, b.x, b.y);
+    ctx.textBaseline = 'alphabetic';
+    if (b.hp < b.maxHp) bar(b.x, b.y - b.h / 2 - 8, b.w, b.hp / b.maxHp, '#4c4', '#c33');
+    if (!b.built) bar(b.x, b.y + b.h / 2 + 4, b.w, b.progress, '#ddd', '#444');
+    else if (b.queue.length) bar(b.x, b.y + b.h / 2 + 4, b.w, b.qTime / UNIT_DEFS[b.queue[0]].time, '#ddd', '#444');
+  }
+
+  for (const u of S.units) {
+    if (S.selected.includes(u)) {
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(u.x, u.y, u.r + 3, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.fillStyle = TEAM_COLOR[u.team];
+    ctx.beginPath();
+    if (u.type === 'soldier') {
+      ctx.moveTo(u.x, u.y - u.r - 1); ctx.lineTo(u.x + u.r + 1, u.y + u.r - 1); ctx.lineTo(u.x - u.r - 1, u.y + u.r - 1); ctx.closePath();
+    } else {
+      ctx.arc(u.x, u.y, u.r, 0, Math.PI * 2);
+    }
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1; ctx.stroke();
+    if (u.carry > 0) { ctx.fillStyle = '#ffd54a'; ctx.beginPath(); ctx.arc(u.x, u.y, 3, 0, Math.PI * 2); ctx.fill(); }
+    if (u.hp < u.maxHp) bar(u.x, u.y - u.r - 7, 20, u.hp / u.maxHp, '#4c4', '#c33');
+    if (u.hit && S.t < u.hit.until) {
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(u.x, u.y); ctx.lineTo(u.hit.x, u.hit.y); ctx.stroke();
+    }
+  }
+
+  if (S.drag) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+    ctx.strokeRect(S.drag.x0, S.drag.y0, S.drag.x1 - S.drag.x0, S.drag.y1 - S.drag.y0);
+  }
+
+  if (S.over || S.paused) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = S.over === 'VICTORY' ? '#7cff7c' : S.over ? '#ff7c7c' : '#fff';
+    ctx.font = 'bold 64px system-ui';
+    ctx.fillText(S.over || 'PAUSED', W / 2, H / 2 - 10);
+    ctx.fillStyle = '#fff'; ctx.font = '20px system-ui';
+    ctx.fillText(S.over ? 'Press R or click to play again' : 'Press P to resume', W / 2, H / 2 + 36);
+  }
+}
+
+// ---------- Loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  refreshTop();
+  refreshPanel();
+  draw();
+  requestAnimationFrame(frame);
+}
+newGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
