@@ -1,0 +1,8 @@
+{
+  "name": "ccforge",
+  "displayName": "CCForge",
+  "description": "Orchestrated skills for mastering Claude Code itself in the terminal and VS Code.",
+  "version": "1.0.0",
+  "license": "MIT",
+  "keywords": ["claude-code", "workflow", "context", "hooks", "skills"]
+}

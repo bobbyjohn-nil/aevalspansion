@@ -1,0 +1,33 @@
+{
+  "name": "forge",
+  "owner": {
+    "name": "FORGE"
+  },
+  "description": "Three orchestrated Claude Code skill packs: webforge, appforge, ccforge.",
+  "plugins": [
+    {
+      "name": "webforge",
+      "source": "./packs/webforge",
+      "description": "Orchestrated skills for building websites and web apps with Claude Code.",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": ["web", "frontend", "nextjs", "build"]
+    },
+    {
+      "name": "appforge",
+      "source": "./packs/appforge",
+      "description": "Orchestrated skills for building mobile, desktop, and full-stack apps with Claude Code.",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": ["mobile", "desktop", "expo", "react-native", "backend"]
+    },
+    {
+      "name": "ccforge",
+      "source": "./packs/ccforge",
+      "description": "Orchestrated skills for mastering Claude Code itself in the terminal and VS Code.",
+      "version": "1.0.0",
+      "category": "development",
+      "tags": ["workflow", "context", "hooks", "skills"]
+    }
+  ]
+}

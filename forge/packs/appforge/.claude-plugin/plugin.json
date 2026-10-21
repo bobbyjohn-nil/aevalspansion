@@ -1,0 +1,8 @@
+{
+  "name": "appforge",
+  "displayName": "AppForge",
+  "description": "Orchestrated skills for building mobile, desktop, and full-stack apps with Claude Code.",
+  "version": "1.0.0",
+  "license": "MIT",
+  "keywords": ["mobile", "desktop", "expo", "react-native", "backend", "build"]
+}
